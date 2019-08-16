@@ -81,4 +81,6 @@ void wifi_scan_null(void);
 /** Call WiFiInterface::scan() with valid accesspoint list allocated */
 void wifi_scan(void);
 
+void wifi_connect_nonblock(void);
+
 #endif //WIFI_TESTS_H

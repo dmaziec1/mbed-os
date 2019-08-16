@@ -427,6 +427,7 @@ private:
     // Driver's state
     int _initialized;
     nsapi_error_t _connect_retval;
+    nsapi_error_t _disconnect_retval;
     bool _get_firmware_ok();
     nsapi_error_t _init(void);
     nsapi_error_t _reset();
@@ -449,8 +450,10 @@ private:
     events::EventQueue *_global_event_queue;
     int _oob_event_id;
     int _connect_event_id;
+    int _disconnect_event_id;
     void proc_oob_evnt();
     void _connect_async();
+    void _disconnect_async();
     rtos::Mutex _cmutex; // Protect asynchronous connection logic
 
 };
