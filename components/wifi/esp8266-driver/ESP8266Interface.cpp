@@ -60,6 +60,7 @@ ESP8266Interface::ESP8266Interface()
       _if_connected(_cmutex),
       _initialized(false),
       _connect_retval(NSAPI_ERROR_OK),
+      _disconnect_retval(false),
       _conn_stat(NSAPI_STATUS_DISCONNECTED),
       _conn_stat_cb(NULL),
       _global_event_queue(mbed_event_queue()), // Needs to be set before attaching event() to SIGIO
@@ -93,6 +94,7 @@ ESP8266Interface::ESP8266Interface(PinName tx, PinName rx, bool debug, PinName r
       _ap_sec(NSAPI_SECURITY_UNKNOWN),
       _if_blocking(true),
       _if_connected(_cmutex),
+      _disconnect_retval(false),
       _initialized(false),
       _conn_stat(NSAPI_STATUS_DISCONNECTED),
       _conn_stat_cb(NULL),
@@ -259,7 +261,7 @@ int ESP8266Interface::connect()
     _cmutex.unlock();
 
     if (!_if_blocking) {
-        return NSAPI_ERROR_OK;
+        return NSAPI_ERROR_WOULD_BLOCK;
     } else {
         return _connect_retval;
     }
@@ -314,40 +316,90 @@ int ESP8266Interface::set_channel(uint8_t channel)
     return NSAPI_ERROR_UNSUPPORTED;
 }
 
-
-int ESP8266Interface::disconnect()
-{
+void ESP8266Interface::_disconnect_async() {
     _cmutex.lock();
+    _disconnect_retval = _esp.disconnect() ? NSAPI_ERROR_OK : NSAPI_ERROR_DEVICE_ERROR;
+    int timeleft_ms = ESP8266_INTERFACE_CONNECT_TIMEOUT_MS - _conn_timer.read_ms();
+
+    if (_disconnect_retval == NSAPI_ERROR_OK
+            || ((_if_blocking == true) && (timeleft_ms <= 0))) {
+
+        if (timeleft_ms <= 0) {
+            _disconnect_retval = NSAPI_ERROR_CONNECTION_TIMEOUT;
+        } else {
+            _esp.bg_process_oob(ESP8266_RECV_TIMEOUT, true);
+            if (_conn_stat != NSAPI_STATUS_DISCONNECTED) {
+                _conn_stat = NSAPI_STATUS_DISCONNECTED;
+            }
+            // In case the status update arrives later inform upper layers manually
+            if (_conn_stat_cb) {
+                _conn_stat_cb(NSAPI_EVENT_CONNECTION_STATUS_CHANGE, _conn_stat);
+            }
+            _disconnect_event_id = 0;
+            _conn_timer.stop();
+            _connect_retval = NSAPI_ERROR_NO_CONNECTION;
+        }
+        // Power down the modem
+        _rst_pin.rst_assert();
+        _if_connected.notify_all();
+    } else {
+        // Postpone to give other stuff time to run
+        _disconnect_event_id = _global_event_queue->call_in(
+                ESP8266_INTERFACE_CONNECT_INTERVAL_MS,
+                callback(this, &ESP8266Interface::_disconnect_async));
+        if (!_disconnect_event_id) {
+            MBED_ERROR(
+                    MBED_MAKE_ERROR(MBED_MODULE_DRIVER, MBED_ERROR_CODE_ENOMEM),
+                    "ESP8266Interface::_disconnect_async(): unable to add event to queue. Increase \"events.shared-eventsize\"\n");
+        }
+    }
+    _cmutex.unlock();
+}
+
+int ESP8266Interface::disconnect() {
+    _cmutex.lock();
+    _disconnect_retval = NSAPI_ERROR_IS_CONNECTED;
+    _disconnect_event_id = 0;
     if (_connect_event_id) {
         _global_event_queue->cancel(_connect_event_id);
         _connect_event_id = 0; // cancel asynchronous connection attempt if one is ongoing
     }
-    _cmutex.unlock();
-    _initialized = false;
 
+    _initialized = false;
     nsapi_error_t status = _conn_status_to_error();
     if (status == NSAPI_ERROR_NO_CONNECTION) {
+        _cmutex.unlock();
         return NSAPI_ERROR_NO_CONNECTION;
     }
 
-    int ret = _esp.disconnect() ? NSAPI_ERROR_OK : NSAPI_ERROR_DEVICE_ERROR;
+    _conn_timer.stop();
+    _conn_timer.reset();
+    _conn_timer.start();
 
-    if (ret == NSAPI_ERROR_OK) {
-        // Try to lure the nw status update from ESP8266, might come later
-        _esp.bg_process_oob(ESP8266_RECV_TIMEOUT, true);
-        // In case the status update arrives later inform upper layers manually
-        if (_conn_stat != NSAPI_STATUS_DISCONNECTED) {
-            _conn_stat = NSAPI_STATUS_DISCONNECTED;
-            if (_conn_stat_cb) {
-                _conn_stat_cb(NSAPI_EVENT_CONNECTION_STATUS_CHANGE, _conn_stat);
-            }
+    _disconnect_event_id = _global_event_queue->call(
+            callback(this, &ESP8266Interface::_disconnect_async));
+
+    if (!_disconnect_event_id) {
+        MBED_ERROR(MBED_MAKE_ERROR(MBED_MODULE_DRIVER, MBED_ERROR_CODE_ENOMEM),
+                "disconnect(): unable to add event to queue. Increase \"events.shared-eventsize\"\n");
+    }
+
+    while (_if_blocking
+            && (_conn_status_to_error() != NSAPI_ERROR_NO_CONNECTION)
+            && (_disconnect_retval != NSAPI_ERROR_OK)) {
+        _if_connected.wait();
+    }
+
+    _cmutex.unlock();
+    if (!_if_blocking) {
+        return NSAPI_ERROR_WOULD_BLOCK;
+    } else {
+        if (_disconnect_retval == NSAPI_ERROR_OK) {
+            return _disconnect_retval;
         }
     }
 
-    // Power down the modem
-    _rst_pin.rst_assert();
-
-    return ret;
+    return _disconnect_retval;
 }
 
 const char *ESP8266Interface::get_ip_address()
